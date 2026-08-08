@@ -10,7 +10,10 @@ services:
       - ASR_ENGINE=whisperx
       - ASR_DEVICE=cpu
       - ASR_QUANTIZATION=int8
-      - UVICORN_WORKERS=6
+      # Каждый воркер держит СВОЮ копию моделей: полностью загруженный ~4,7 ГБ.
+      # На 6 воркерах это ~28 ГБ, и своп на сервере уходил в ноль, вытесняя
+      # MySQL Bitrix. 4 = ASR_MAX_PARALLEL_FILES у Sales Evaluator, очереди нет.
+      - UVICORN_WORKERS=4
     ports:
       # Порт больше НЕ слушает публичный IP. Только:
       #   172.17.0.1 — шлюз docker0, сюда ходит Sales Evaluator

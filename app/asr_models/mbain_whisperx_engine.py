@@ -1,3 +1,4 @@
+import gc
 import time
 from io import StringIO
 from threading import Thread
@@ -55,28 +56,41 @@ class WhisperXASR(ASRModel):
             if self.model is None:
                 self.load_model()
 
-        options_dict = {"task": task}
-        if language:
-            options_dict["language"] = language
+        # Язык не задан — определяем сами по нескольким окнам и передаём дальше
+        # явно. whisperX тогда пропускает собственную детекцию по первым 30 с,
+        # а вызывающая сторона получает confidence прямо в ответе /asr.
+        language_confidence = None
+        if not language:
+            language, language_confidence = self.language_detection(audio)
+            print(f"Auto-detected language: {language} (confidence {language_confidence})")
+        else:
             print(f"Using specified language: {language}")
+
+        options_dict = {"task": task, "language": language}
         if initial_prompt:
             options_dict["initial_prompt"] = initial_prompt
         with self.model_lock:
             result = self.model['whisperx'].transcribe(audio, **options_dict)
-            detected_language = result["language"]
-            if language and detected_language != language:
-                print(f"WARNING: Specified language '{language}' differs from detected language '{detected_language}'")
-            language = detected_language
+            language = result["language"]
 
-        # Load the required model and cache it
-        # If we transcribe models in many different languages, this may lead to OOM propblems
-        if result["language"] in self.model['align_model']:
-            model_x, metadata = self.model['align_model'][result["language"]]
-        else:
-            self.model['align_model'][result["language"]] = whisperx.load_align_model(
-                language_code=result["language"], device=CONFIG.DEVICE
-            )
-            model_x, metadata = self.model['align_model'][result["language"]]
+        # Держим модель выравнивания ровно для ОДНОГО языка.
+        # Раньше словарь рос без ограничений, и на смешанном потоке uk+ru+pl
+        # каждый воркер добирал по ~1,2 ГБ на язык: четыре воркера давали ~28 ГБ,
+        # сервер уходил в своп и вытеснял оттуда MySQL Bitrix.
+        # Смена языка стоит 5-20 с перезагрузки с диска. Чтобы её почти не было,
+        # группируйте очередь звонков по языку.
+        with self.model_lock:
+            lang = result["language"]
+            if lang not in self.model['align_model']:
+                if self.model['align_model']:
+                    dropped = ", ".join(self.model['align_model'].keys())
+                    self.model['align_model'].clear()
+                    gc.collect()
+                    print(f"Align model cache: unloaded '{dropped}', loading '{lang}'")
+                self.model['align_model'][lang] = whisperx.load_align_model(
+                    language_code=lang, device=CONFIG.DEVICE
+                )
+            model_x, metadata = self.model['align_model'][lang]
 
         # Align whisper output
         result = whisperx.align(
@@ -90,6 +104,8 @@ class WhisperXASR(ASRModel):
             diarize_segments = self.model['diarize_model'](audio, min_speakers, max_speakers)
             result = whisperx.assign_word_speakers(diarize_segments, result)
         result["language"] = language
+        # None, если язык был задан явно; число — если определяли сами.
+        result["language_confidence"] = language_confidence
 
         # Apply initial silence offset if specified
         offset = 0.0
@@ -114,16 +130,69 @@ class WhisperXASR(ASRModel):
 
         return output_file
 
+    # Сколько 30-секундных окон опрашивать и где их брать (доля от полезной длины).
+    LANGUAGE_DETECTION_WINDOWS = (0.0, 0.5, 0.85)
+
     def language_detection(self, audio):
+        """
+        Определяет язык по нескольким окнам, разнесённым по всей записи.
+
+        Штатный language_detection_segments у faster-whisper берёт окна подряд
+        от начала и обрывается на первом же уверенном — для звонка, который
+        начинается с приветствия, гудков или музыки, это бесполезно. Здесь окна
+        разнесены по началу, середине и концу разговора.
+
+        Возвращает (код языка, confidence), где confidence — доля победителя в
+        сумме вероятностей по окнам. Она падает и когда модель не уверена, и
+        когда окна расходятся между собой: для смешанных звонков это ровно то,
+        что нужно отлавливать порогом.
+        """
         with self.model_lock:
             if self.model is None:
                 self.load_model()
-            if audio.shape[0] < N_SAMPLES:
+
+            total = audio.shape[0]
+            if total < N_SAMPLES:
                 print("Warning: audio is shorter than 30s, language detection may be inaccurate.")
-            results = self.model['whisperx'].model.detect_language(audio)
-            language = results[0]
-            language_probability = round(float(results[1]), 2)
-            print(f"Detected language: {language} ({language_probability}) in first 30s of audio...")
+
+            if total <= N_SAMPLES:
+                starts = [0]
+            else:
+                usable = total - N_SAMPLES
+                starts = sorted({int(usable * f) for f in self.LANGUAGE_DETECTION_WINDOWS})
+
+            scores = {}
+            probed = []
+            for start in starts:
+                window = audio[start:start + N_SAMPLES]
+                # Огрызок короче 5 с — шума больше, чем пользы.
+                if window.shape[0] < N_SAMPLES // 6:
+                    continue
+                lang, prob, _ = self.model['whisperx'].model.detect_language(
+                    window, language_detection_segments=1
+                )
+                prob = float(prob)
+                scores[lang] = scores.get(lang, 0.0) + prob
+                probed.append(f"{start // 16000}s:{lang}={prob:.2f}")
+
+            # Запись короче 5 с: все окна отсеялись — спрашиваем по целому файлу.
+            if not scores:
+                lang, prob, _ = self.model['whisperx'].model.detect_language(
+                    audio, language_detection_segments=1
+                )
+                scores[lang] = float(prob)
+                probed.append(f"full:{lang}={float(prob):.2f}")
+
+            language = max(scores, key=scores.get)
+            # Делим на ЧИСЛО ОКОН, а не на сумму вероятностей. Иначе три окна,
+            # согласно указавшие один язык с жалкой вероятностью 0.39 каждое
+            # (шум, музыка, тишина), дали бы confidence 1.0. При таком делении
+            # метрика падает и от неуверенности модели, и от расхождения окон.
+            language_probability = round(scores[language] / len(probed), 2)
+            print(
+                f"Detected language: {language} ({language_probability}) "
+                f"from {len(probed)} window(s): {', '.join(probed)}"
+            )
         return language, language_probability
 
 
