@@ -12,10 +12,37 @@ services:
       - ASR_QUANTIZATION=int8
       - UVICORN_WORKERS=6
     ports:
-      - "9000:9000"
+      # Порт больше НЕ слушает публичный IP. Только:
+      #   172.17.0.1 — шлюз docker0, сюда ходит Sales Evaluator
+      #                (у него ASR_API_URL=http://host.docker.internal:9000,
+      #                 а host.docker.internal резолвится именно в 172.17.0.1)
+      #   127.0.0.1  — отладка с самого сервера
+      # Внешний доступ идёт через asr-gateway на :9443 с API-ключом.
+      - "172.17.0.1:9000:9000"
+      - "127.0.0.1:9000:9000"
     volumes:
       - ./app:/app/app
       - cache-whisper:/root/.cache
+
+  # Внешний вход: HTTPS + API-ключ. Внутрь стека ходит по docker-сети,
+  # поэтому опубликованный порт whisper ему не нужен.
+  asr-gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - whisper-asr-webservice
+    environment:
+      # Ключ берётся из .env; envsubst подставит его в конфиг при старте.
+      - ASR_API_KEY=${ASR_API_KEY:?ASR_API_KEY не задан в .env}
+      # Подставлять только эту переменную, конфиг nginx не трогать.
+      - NGINX_ENVSUBST_FILTER=^ASR_API_KEY$$
+    ports:
+      - "9443:443"
+    volumes:
+      - ./nginx/asr.conf.template:/etc/nginx/templates/asr.conf.template:ro
+      # Существующий сертификат Let's Encrypt для app.24print.ua.
+      # Только чтение; certbot на хосте продолжает обновлять его как обычно.
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 
 volumes:
   cache-whisper:

@@ -15,7 +15,10 @@ services:
     environment:
       - ASR_MODEL=base
     ports:
-      - "9000:9000"
+      # Не публикуем на внешний IP — см. комментарий в docker-compose.yml.
+      # Внешний доступ только через asr-gateway с API-ключом.
+      - "172.17.0.1:9000:9000"
+      - "127.0.0.1:9000:9000"
     volumes:
       - ./app:/app/app
       - cache-whisper:/root/.cache

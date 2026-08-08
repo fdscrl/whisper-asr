@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Внешний защищённый вход в Whisper ASR.
+#
+#   Интернет ──HTTPS :9443, X-API-Key──> этот nginx ──> whisper-asr-webservice:9000
+#   Sales Evaluator ──HTTP 172.17.0.1:9000──────────────> whisper-asr-webservice:9000
+#                                                         (напрямую, без ключа)
+#
+# Ключ ASR_API_KEY подставляется из .env при старте контейнера (envsubst).
+# Переменные вида $host / $remote_addr — это переменные nginx, они НЕ трогаются:
+# entrypoint образа подставляет только форму ${VAR}.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Лог с временем и длительностью запроса — у самого whisper их нет.
+log_format asr '$remote_addr [$time_local] "$request" '
+               'status=$status bytes=$body_bytes_sent '
+               'req_time=$request_time upstream_time=$upstream_response_time';
+
+# Строка "Bearer <64-символьный ключ>" длиннее дефолтных 64 байт,
+# без этого nginx не соберёт map_hash и откажется стартовать.
+map_hash_bucket_size 128;
+
+# Проверка ключа. Принимаем два варианта заголовка — какой удобнее клиенту:
+#   X-API-Key: <ключ>
+#   Authorization: Bearer <ключ>
+map $http_x_api_key $asr_key_ok {
+    default          0;
+    "${ASR_API_KEY}" 1;
+}
+
+map $http_authorization $asr_bearer_ok {
+    default                 0;
+    "Bearer ${ASR_API_KEY}" 1;
+}
+
+# "00" — не подошёл ни один заголовок. Любая другая комбинация = доступ разрешён.
+map "$asr_key_ok$asr_bearer_ok" $asr_authorized {
+    default 1;
+    "00"    0;
+}
+
+# Чтобы внешний клиент не занял все 6 воркеров и не остановил расшифровку
+# звонков Sales Evaluator. Поднимите число, если нужна пакетная загрузка.
+limit_conn_zone $server_name zone=asr_conn:1m;
+
+server {
+    listen              443 ssl;
+    http2               on;
+    server_name         app.24print.ua;
+
+    # Существующий сертификат Let's Encrypt, смонтирован только на чтение.
+    ssl_certificate     /etc/letsencrypt/live/app.24print.ua/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/app.24print.ua/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:asr_ssl:5m;
+    ssl_session_timeout 1h;
+
+    access_log /var/log/nginx/asr_access.log asr;
+    error_log  /var/log/nginx/asr_error.log warn;
+
+    default_type         application/json;
+    client_max_body_size 1024m;
+    limit_conn           asr_conn 3;
+
+    # Не отдаём наружу версию nginx.
+    server_tokens off;
+
+    location / {
+        if ($asr_authorized = 0) {
+            return 401 '{"error":"unauthorized","detail":"missing or invalid API key"}';
+        }
+
+        proxy_pass         http://whisper-asr-webservice:9000;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+
+        # Файл стримится в бэкенд и ответ отдаётся сразу,
+        # без буферизации всей записи на диск nginx.
+        proxy_request_buffering off;
+        proxy_buffering         off;
+
+        # КРИТИЧНО: large-v3 на CPU + диаризация — это десятки минут.
+        # Дефолтные 60s оборвали бы расшифровку на середине.
+        proxy_connect_timeout 60s;
+        proxy_send_timeout    3600s;
+        proxy_read_timeout    3600s;
+        send_timeout          3600s;
+    }
+}
