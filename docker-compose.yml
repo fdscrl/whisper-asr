@@ -23,6 +23,11 @@ services:
       # per worker overnight and at weekends. The cost: the first request of
       # the morning waits ~20-30s for them to load again.
       - MODEL_IDLE_TIMEOUT=1800
+      # Restart a worker every 50+-10 files. It leaves between files, finishing
+      # the transcription in hand first; the supervisor starts a fresh one
+      # within 0.5s.
+      - MAX_REQUESTS_PER_WORKER=50
+      - MAX_REQUESTS_JITTER=10
     ports:
       # Порт больше НЕ слушает публичный IP. Только:
       #   172.17.0.1 — шлюз docker0, сюда ходит Sales Evaluator

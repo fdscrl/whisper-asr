@@ -1,5 +1,7 @@
 import importlib.metadata
 import os
+import random
+import signal
 from os import path
 from threading import Lock
 from typing import Annotated, Optional, Union
@@ -9,8 +11,9 @@ import click
 import uvicorn
 from fastapi import FastAPI, File, Query, UploadFile, applications
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from whisper import tokenizer
 
 from app.config import CONFIG
@@ -20,6 +23,70 @@ from app.utils import load_audio
 # Lazy loading: model will be loaded per worker on first request
 asr_model = None
 asr_model_lock = Lock()
+
+# Scheduled worker restart, counted in processed files.
+#
+# Why: over ten days a worker grows from 4.7 to 8.4 GB, and at some point the
+# kernel picks the Bitrix mysqld as its victim rather than the worker. Here the
+# worker leaves on its own, between files: it finishes sending the current
+# response, closes the connection and exits, while the uvicorn supervisor
+# starts a fresh one within half a second (keep_subprocess_alive in
+# uvicorn/supervisors/multiprocess.py). No request is ever cut short.
+#
+# The jitter keeps the four workers from recycling in lockstep: each picks its
+# own threshold when the process starts.
+#
+# gunicorn --max-requests is no use here: UvicornWorker never increments
+# gunicorn's counter, so the flag silently does nothing.
+MAX_REQUESTS_PER_WORKER = int(os.getenv("MAX_REQUESTS_PER_WORKER", "0"))
+MAX_REQUESTS_JITTER = int(os.getenv("MAX_REQUESTS_JITTER", "0"))
+RECYCLE_AFTER = (
+    MAX_REQUESTS_PER_WORKER + random.randint(0, MAX_REQUESTS_JITTER)
+    if MAX_REQUESTS_PER_WORKER > 0
+    else 0
+)
+
+requests_served = 0
+recycle_signalled = False
+requests_served_lock = Lock()
+
+
+def note_request_finished():
+    """
+    Count a finished file and, when due, send the worker off to restart.
+
+    Called from a Starlette background task, that is, only once the response
+    body has gone out to the client in full.
+    """
+    global requests_served, recycle_signalled
+    if not RECYCLE_AFTER:
+        return
+    with requests_served_lock:
+        requests_served += 1
+        served = requests_served
+        # While uvicorn drains its remaining connections more files still
+        # arrive here. Signal exactly once: repeated SIGTERMs change nothing
+        # but clutter the log.
+        if served < RECYCLE_AFTER or recycle_signalled:
+            return
+        recycle_signalled = True
+    print(f"Worker {os.getpid()}: {served} requests served, restarting on schedule")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def load_asr_model():
+    """
+    Load the model on first use, one per worker, in a thread-safe way.
+    """
+    global asr_model
+    if asr_model is None:
+        with asr_model_lock:
+            # Double-check pattern: another thread might have loaded it while we waited
+            if asr_model is None:
+                model = ASRModelFactory.create_asr_model()
+                model.load_model()
+                asr_model = model
+    return asr_model
 
 LANGUAGE_CODES = sorted(tokenizer.LANGUAGES.keys())
 
@@ -98,16 +165,7 @@ async def asr(
     ),
     output: Union[str, None] = Query(default="txt", enum=["txt", "vtt", "srt", "tsv", "json"]),
 ):
-    global asr_model
-    # Lazy loading: load model on first request per worker (thread-safe)
-    if asr_model is None:
-        with asr_model_lock:
-            # Double-check pattern: another thread might have loaded it while we waited
-            if asr_model is None:
-                asr_model = ASRModelFactory.create_asr_model()
-                asr_model.load_model()
-    
-    result = asr_model.transcribe(
+    result = load_asr_model().transcribe(
         load_audio(audio_file.file, encode),
         task,
         language,
@@ -130,6 +188,7 @@ async def asr(
             "Asr-Engine": CONFIG.ASR_ENGINE,
             "Content-Disposition": f'attachment; filename="{quote(audio_file.filename)}.{output}"',
         },
+        background=BackgroundTask(note_request_finished),
     )
 
 
@@ -138,21 +197,15 @@ async def detect_language(
     audio_file: UploadFile = File(...),  # noqa: B008
     encode: bool = Query(default=True, description="Encode audio first through FFmpeg"),
 ):
-    global asr_model
-    # Lazy loading: load model on first request per worker (thread-safe)
-    if asr_model is None:
-        with asr_model_lock:
-            # Double-check pattern: another thread might have loaded it while we waited
-            if asr_model is None:
-                asr_model = ASRModelFactory.create_asr_model()
-                asr_model.load_model()
-    
-    detected_lang_code, confidence = asr_model.language_detection(load_audio(audio_file.file, encode))
-    return {
-        "detected_language": tokenizer.LANGUAGES[detected_lang_code],
-        "language_code": detected_lang_code,
-        "confidence": confidence,
-    }
+    detected_lang_code, confidence = load_asr_model().language_detection(load_audio(audio_file.file, encode))
+    return JSONResponse(
+        content={
+            "detected_language": tokenizer.LANGUAGES[detected_lang_code],
+            "language_code": detected_lang_code,
+            "confidence": confidence,
+        },
+        background=BackgroundTask(note_request_finished),
+    )
 
 
 @click.command()
