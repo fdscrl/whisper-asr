@@ -15,13 +15,27 @@ from app.utils import calculate_initial_silence, trim_heap
 
 
 class WhisperXASR(ASRModel):
+    @staticmethod
+    def _empty_model():
+        return {'whisperx': None, 'diarize_model': None, 'align_model': {}}
+
     def __init__(self):
         super().__init__()
-        self.model = {
-            'whisperx': None,
-            'diarize_model': None,
-            'align_model': {}
-        }
+        self.model = self._empty_model()
+
+    def release_model(self):
+        """
+        Release the models after an idle period.
+
+        The base implementation sets self.model to None, which broke WhisperX:
+        load_model() writes to self.model['whisperx'], so the first request
+        after an idle period raised TypeError. Empty the dict instead — the
+        structure stays, only the contents go.
+        """
+        self.model = self._empty_model()
+        gc.collect()
+        trim_heap()
+        print("Model unloaded due to timeout")
 
     def load_model(self):
         asr_options = {"without_timestamps": False}
@@ -53,7 +67,7 @@ class WhisperXASR(ASRModel):
     ):
         self.last_activity_time = time.time()
         with self.model_lock:
-            if self.model is None:
+            if self.model['whisperx'] is None:
                 self.load_model()
 
         # Язык не задан — определяем сами по нескольким окнам и передаём дальше
@@ -158,7 +172,7 @@ class WhisperXASR(ASRModel):
         что нужно отлавливать порогом.
         """
         with self.model_lock:
-            if self.model is None:
+            if self.model['whisperx'] is None:
                 self.load_model()
 
             total = audio.shape[0]

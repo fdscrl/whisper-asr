@@ -19,6 +19,10 @@ services:
       # ten days a worker reached 8.4 GB RSS on a 4.7 GB working set.
       - MALLOC_ARENA_MAX=2
       - MALLOC_TRIM_THRESHOLD_=134217728
+      # Unload the models after half an hour of idleness, which frees ~5 GB
+      # per worker overnight and at weekends. The cost: the first request of
+      # the morning waits ~20-30s for them to load again.
+      - MODEL_IDLE_TIMEOUT=1800
     ports:
       # Порт больше НЕ слушает публичный IP. Только:
       #   172.17.0.1 — шлюз docker0, сюда ходит Sales Evaluator

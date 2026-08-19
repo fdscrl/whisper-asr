@@ -7,6 +7,7 @@ from typing import Union
 import torch
 
 from app.config import CONFIG
+from app.utils import trim_heap
 
 
 class ASRModel(ABC):
@@ -60,17 +61,24 @@ class ASRModel(ABC):
             return
         while True:
             time.sleep(15)
-            if time.time() - self.last_activity_time > CONFIG.MODEL_IDLE_TIMEOUT:
-                with self.model_lock:
-                    self.release_model()
-                    break
+            if time.time() - self.last_activity_time <= CONFIG.MODEL_IDLE_TIMEOUT:
+                continue
+            with self.model_lock:
+                # Re-check now that we hold the lock. Transcription keeps it
+                # for its whole run, so while we waited a request may have
+                # started and finished; never unload under a live caller.
+                if time.time() - self.last_activity_time <= CONFIG.MODEL_IDLE_TIMEOUT:
+                    continue
+                self.release_model()
+                break
 
     def release_model(self):
         """
         Unloads the model from memory and clears any cached GPU memory.
         """
-        del self.model
-        torch.cuda.empty_cache()
-        gc.collect()
         self.model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        trim_heap()
         print("Model unloaded due to timeout")
