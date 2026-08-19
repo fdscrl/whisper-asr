@@ -14,6 +14,11 @@ services:
       # На 6 воркерах это ~28 ГБ, и своп на сервере уходил в ноль, вытесняя
       # MySQL Bitrix. 4 = ASR_MAX_PARALLEL_FILES у Sales Evaluator, очереди нет.
       - UVICORN_WORKERS=4
+      # Keep malloc down to two arenas and release anything above 128 MB back
+      # to the kernel. Until now freed memory stayed in the glibc arenas: over
+      # ten days a worker reached 8.4 GB RSS on a 4.7 GB working set.
+      - MALLOC_ARENA_MAX=2
+      - MALLOC_TRIM_THRESHOLD_=134217728
     ports:
       # Порт больше НЕ слушает публичный IP. Только:
       #   172.17.0.1 — шлюз docker0, сюда ходит Sales Evaluator

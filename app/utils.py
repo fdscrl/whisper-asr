@@ -1,3 +1,5 @@
+import ctypes
+import ctypes.util
 import json
 import os
 from dataclasses import asdict
@@ -200,3 +202,44 @@ def calculate_initial_silence(
     # Return time offset in seconds
     offset = (speech_start_window * window_size) / sample_rate
     return max(0.0, offset)
+
+
+def _load_malloc_trim():
+    """
+    Look up malloc_trim in libc, returning None when it is not there.
+
+    The symbol is glibc-only; on musl and friends it is missing, and in that
+    case trim_heap() turns into a no-op instead of failing at import time.
+    """
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        fn = libc.malloc_trim
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_MALLOC_TRIM = _load_malloc_trim()
+
+
+def trim_heap():
+    """
+    Hand memory freed inside the process back to the kernel.
+
+    gc.collect() returns objects to the Python allocator, which returns them
+    to glibc, and there the chain stops: the memory never reaches the kernel
+    and keeps counting towards RSS. That is expensive for WhisperX. Every
+    align-model reload frees ~1.2 GB that settles into malloc arenas as holes,
+    so over ten days a worker grows to 8.4 GB against a 4.7 GB working set.
+    Four such workers push the Bitrix MySQL into swap, and the OOM-killer
+    follows.
+
+    malloc_trim(0) walks the arenas and releases whatever pages it can. The
+    call costs milliseconds and runs between files, so it does not show up in
+    transcription time.
+    """
+    if _MALLOC_TRIM is None:
+        return
+    _MALLOC_TRIM(0)

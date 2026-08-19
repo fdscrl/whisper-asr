@@ -11,7 +11,7 @@ from whisperx.utils import ResultWriter, SubtitlesWriter, WriteJSON, WriteSRT, W
 
 from app.asr_models.asr_model import ASRModel
 from app.config import CONFIG
-from app.utils import calculate_initial_silence
+from app.utils import calculate_initial_silence, trim_heap
 
 
 class WhisperXASR(ASRModel):
@@ -86,6 +86,7 @@ class WhisperXASR(ASRModel):
                     dropped = ", ".join(self.model['align_model'].keys())
                     self.model['align_model'].clear()
                     gc.collect()
+                    trim_heap()
                     print(f"Align model cache: unloaded '{dropped}', loading '{lang}'")
                 self.model['align_model'][lang] = whisperx.load_align_model(
                     language_code=lang, device=CONFIG.DEVICE
@@ -127,6 +128,15 @@ class WhisperXASR(ASRModel):
         output_file = StringIO()
         self.write_result(result, output_file, output)
         output_file.seek(0)
+
+        # The intermediate tensors for this file are freed, but glibc holds
+        # on to them. Give them back to the kernel here, between files,
+        # rather than accumulating until the OOM-killer steps in.
+        gc.collect()
+        trim_heap()
+        # Stamp activity on completion as well, otherwise a long transcription
+        # looks like idleness to monitor_idleness.
+        self.last_activity_time = time.time()
 
         return output_file
 
