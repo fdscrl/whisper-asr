@@ -14,6 +14,11 @@ services:
       # На 6 воркерах это ~28 ГБ, и своп на сервере уходил в ноль, вытесняя
       # MySQL Bitrix. 4 = ASR_MAX_PARALLEL_FILES у Sales Evaluator, очереди нет.
       - UVICORN_WORKERS=4
+      # Cap the torch/ctranslate2 thread pools: 18 cores across 4 workers.
+      # Without this each worker spawned one thread per core, they fought over
+      # the CPU, and every thread claimed its OWN malloc arena, that is, its
+      # own reserve of memory never given back.
+      - OMP_NUM_THREADS=4
       # Keep malloc down to two arenas and release anything above 128 MB back
       # to the kernel. Until now freed memory stayed in the glibc arenas: over
       # ten days a worker reached 8.4 GB RSS on a 4.7 GB working set.
@@ -40,6 +45,17 @@ services:
     volumes:
       - ./app:/app/app
       - cache-whisper:/root/.cache
+    # Memory ceiling. Four fresh workers take ~19 GB; 28 leaves room for peaks
+    # while stopping the container from growing back to the 36 GB at which the
+    # kernel picked the Bitrix mysqld as its victim. On hitting the limit the
+    # kernel kills a worker inside the container, and the master survives to
+    # start a replacement.
+    mem_limit: 28g
+    # Equal to mem_limit, which denies the container swap altogether. Until now
+    # whisper held 3.8 GB of the 6.8 GB in use — the very swap MySQL relies on
+    # during its peaks.
+    memswap_limit: 28g
+    restart: unless-stopped
 
   # Внешний вход: HTTPS + API-ключ. Внутрь стека ходит по docker-сети,
   # поэтому опубликованный порт whisper ему не нужен.
