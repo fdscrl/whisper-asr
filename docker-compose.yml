@@ -30,10 +30,10 @@ services:
       # whole container, because the weights are mmap'd safetensors shared
       # between workers. Private memory per worker does not move.
       - ALIGN_MODEL_LANGUAGES=uk,ru,pl
-      # Unload the models after half an hour of idleness, which frees ~5 GB
-      # per worker overnight and at weekends. The cost: the first request of
-      # the morning waits ~20-30s for them to load again.
-      - MODEL_IDLE_TIMEOUT=1800
+      # Never unload on idleness. At 1800 the models were dropped 25 times a
+      # day, so roughly every sixth call waited 20-30s for a reload - and it
+      # would throw away the pinned align models above along with them.
+      - MODEL_IDLE_TIMEOUT=0
       # Restart a worker every 50+-10 files. It leaves between files, finishing
       # the transcription in hand first; the supervisor starts a fresh one
       # within 0.5s.
