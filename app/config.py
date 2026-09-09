@@ -34,6 +34,13 @@ class CONFIG:
     if MODEL_QUANTIZATION not in {"float32", "float16", "int8"}:
         raise ValueError("Invalid MODEL_QUANTIZATION. Choose 'float32', 'float16', or 'int8'.")
 
+    # Languages whose align model is pinned in every worker for its whole life.
+    # Comma-separated, e.g. "uk,ru,pl". Empty keeps the previous behaviour of
+    # holding one language at a time.
+    ALIGN_MODEL_LANGUAGES = [
+        lang.strip() for lang in os.getenv("ALIGN_MODEL_LANGUAGES", "").split(",") if lang.strip()
+    ]
+
     # Idle timeout in seconds. If set to a non-zero value, the model will be unloaded
     # after being idle for this many seconds. A value of 0 means the model will never be unloaded.
     MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", 0))

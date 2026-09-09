@@ -24,6 +24,12 @@ services:
       # ten days a worker reached 8.4 GB RSS on a 4.7 GB working set.
       - MALLOC_ARENA_MAX=2
       - MALLOC_TRIM_THRESHOLD_=134217728
+      # Align models kept hot in every worker. The call queue mixes Ukrainian,
+      # Russian and Polish, and reloading one costs 5-20s on every switch.
+      # Measured cost of pinning all three: ~3.6 GiB of page cache for the
+      # whole container, because the weights are mmap'd safetensors shared
+      # between workers. Private memory per worker does not move.
+      - ALIGN_MODEL_LANGUAGES=uk,ru,pl
       # Unload the models after half an hour of idleness, which frees ~5 GB
       # per worker overnight and at weekends. The cost: the first request of
       # the morning waits ~20-30s for them to load again.

@@ -52,7 +52,44 @@ class WhisperXASR(ASRModel):
                 device=CONFIG.DEVICE
             )
 
+        # Pin the align models the call queue actually uses, so a mixed
+        # uk/ru/pl stream never pays the reload when the language changes.
+        for lang in CONFIG.ALIGN_MODEL_LANGUAGES:
+            self._align_model_for(lang)
+
         Thread(target=self.monitor_idleness, daemon=True).start()
+
+    def _align_model_for(self, lang):
+        """
+        Return (model, metadata) for `lang`, loading it if it is not cached.
+
+        Callers must already hold self.model_lock; this method never takes it.
+
+        Languages in ALIGN_MODEL_LANGUAGES are pinned and stay for the life of
+        the worker. That is affordable because the weights come from mmap'd
+        safetensors: measured on this host, three pinned languages add ~3.6 GiB
+        of page cache shared by every worker, and nothing to private memory.
+
+        Any other language gets a single slot and is evicted as soon as a
+        different unpinned language shows up, so one stray request for an
+        unexpected language cannot grow the cache without bound.
+        """
+        cache = self.model['align_model']
+        if lang in cache:
+            return cache[lang]
+
+        if lang not in CONFIG.ALIGN_MODEL_LANGUAGES:
+            evicted = [c for c in cache if c not in CONFIG.ALIGN_MODEL_LANGUAGES]
+            for old_lang in evicted:
+                del cache[old_lang]
+            if evicted:
+                gc.collect()
+                trim_heap()
+                print(f"Align model cache: evicted unpinned {evicted}")
+
+        print(f"Align model cache: loading '{lang}'")
+        cache[lang] = whisperx.load_align_model(language_code=lang, device=CONFIG.DEVICE)
+        return cache[lang]
 
     def transcribe(
         self,
@@ -87,25 +124,8 @@ class WhisperXASR(ASRModel):
             result = self.model['whisperx'].transcribe(audio, **options_dict)
             language = result["language"]
 
-        # Держим модель выравнивания ровно для ОДНОГО языка.
-        # Раньше словарь рос без ограничений, и на смешанном потоке uk+ru+pl
-        # каждый воркер добирал по ~1,2 ГБ на язык: четыре воркера давали ~28 ГБ,
-        # сервер уходил в своп и вытеснял оттуда MySQL Bitrix.
-        # Смена языка стоит 5-20 с перезагрузки с диска. Чтобы её почти не было,
-        # группируйте очередь звонков по языку.
         with self.model_lock:
-            lang = result["language"]
-            if lang not in self.model['align_model']:
-                if self.model['align_model']:
-                    dropped = ", ".join(self.model['align_model'].keys())
-                    self.model['align_model'].clear()
-                    gc.collect()
-                    trim_heap()
-                    print(f"Align model cache: unloaded '{dropped}', loading '{lang}'")
-                self.model['align_model'][lang] = whisperx.load_align_model(
-                    language_code=lang, device=CONFIG.DEVICE
-                )
-            model_x, metadata = self.model['align_model'][lang]
+            model_x, metadata = self._align_model_for(result["language"])
 
         # Align whisper output
         result = whisperx.align(
