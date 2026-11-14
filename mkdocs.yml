@@ -18,6 +18,7 @@ nav:
   - Installation & Usage: run.md
   - API Endpoints: endpoints.md
   - Configuration: environmental-variables.md
+  - Transcription evaluation: transcription-evaluation.md
   - Development: build.md
   - Changelog: changelog.md
   - License: licence.md
