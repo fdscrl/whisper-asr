@@ -66,7 +66,7 @@ services:
   # Внешний вход: HTTPS + API-ключ. Внутрь стека ходит по docker-сети,
   # поэтому опубликованный порт whisper ему не нужен.
   asr-gateway:
-    image: nginx:1.27-alpine
+    image: nginx:1.30-alpine
     restart: unless-stopped
     depends_on:
       - whisper-asr-webservice
